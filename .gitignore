@@ -1,0 +1,7 @@
+__pycache__
+Tennis_Linux
+.vscode
+.ipynb_checkpoints
+*test*
+unity-environment.log
+trained/
