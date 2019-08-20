@@ -12,8 +12,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from misc import get_env_info
-from utilities import transpose_to_tensor, transpose_list
+from utilities import get_env_info, transpose_to_tensor, transpose_list, soft_update
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -21,7 +20,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 class AgentDDPG():
     """Interacts with and learns from the environment."""
 
-    def __init__(self, state_size, action_size, params):
+    def __init__(self, state_size, action_size, params, n_agents=2):
         """Initialize an Agent object.
 
         Params
@@ -44,12 +43,20 @@ class AgentDDPG():
             self.actor_local.parameters(), lr=params["lr_actor"])
 
         # Critic Network (w/ Target Network)
-        self.critic_local = Critic(
-            state_size, action_size, params).to(device)
-        self.critic_target = Critic(
-            state_size, action_size, params).to(device)
-        self.critic_optimizer = optim.Adam(
-            self.critic_local.parameters(), lr=params["lr_critic"], weight_decay=params["weight_decay"])
+        if params["type"] == "MADDPG":
+            self.critic_local = Critic(
+                n_agents * state_size, n_agents * action_size, params).to(device)
+            self.critic_target = Critic(
+                n_agents * state_size, n_agents * action_size, params).to(device)
+            self.critic_optimizer = optim.Adam(
+                self.critic_local.parameters(), lr=params["lr_critic"], weight_decay=params["weight_decay"])
+        else:
+            self.critic_local = Critic(
+                state_size, action_size, params).to(device)
+            self.critic_target = Critic(
+                state_size, action_size, params).to(device)
+            self.critic_optimizer = optim.Adam(
+                self.critic_local.parameters(), lr=params["lr_critic"], weight_decay=params["weight_decay"])
 
         # initialize targets same as original networks
         hard_update(self.actor_target, self.actor_local)
@@ -87,31 +94,39 @@ class AgentDDPG():
                     experiences = self.memory.sample()
                     self.learn(experiences, self.params["gamma"])
 
-    def act(self, state, add_noise=True):
+    def act(self, state, add_noise=True, no_grad=True):
         """Returns actions for given state as per current policy."""
-        state = torch.from_numpy(state).float().to(device)
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).float().to(device)
         if len(state.shape) == 1:
             state = state.unsqueeze(0)
-        self.actor_local.eval()
-        with torch.no_grad():
-            action = self.actor_local(state).cpu().data.numpy()
-        self.actor_local.train()
+        if no_grad:
+            self.actor_local.eval()
+            with torch.no_grad():
+                action = self.actor_local(state)  # .cpu().data.numpy()
+            self.actor_local.train()
+        else:
+            action = self.actor_local(state)  # .cpu().data.numpy()
         if add_noise:
-            action += self.noise.sample()
-        return np.clip(action, -1, 1)
+            action += torch.from_numpy(self.noise.sample()).float().to(device)
+        return torch.clamp(action, -1, 1)
 
-    def target_act(self, state, add_noise=True):
+    def target_act(self, state, add_noise=True, no_grad=True):
         """Returns actions for given state as per current policy."""
-        state = torch.from_numpy(state).float().to(device)
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).float().to(device)
         if len(state.shape) == 1:
             state = state.unsqueeze(0)
-        self.actor_local.eval()
-        with torch.no_grad():
-            action = self.actor_target(state).cpu().data.numpy()
-        self.actor_local.train()
+        if no_grad:
+            self.actor_target.eval()
+            with torch.no_grad():
+                action = self.actor_target(state)  # .cpu().data.numpy()
+            self.actor_target.train()
+        else:
+            action = self.actor_target(state)  # .cpu().data.numpy()
         if add_noise:
-            action += self.noise.sample()
-        return np.clip(action, -1, 1)
+            action += torch.from_numpy(self.noise.sample()).float().to(device)
+        return torch.clamp(action, -1, 1)
 
     def reset(self):
         self.noise.reset()
@@ -183,8 +198,20 @@ class AgentMADDPG:
         self.params = params
 
         brain_name, n_agents, state_size, action_size = get_env_info(env)
+        self.state_size = state_size
+        self.action_size = action_size
+        self.n_agents = n_agents
         self.maddpg_agent = [AgentDDPG(
-            state_size=state_size, action_size=action_size, params=params) for _ in range(n_agents)]
+            state_size=state_size, action_size=action_size, params=params, n_agents=self.n_agents) for _ in range(self.n_agents)]
+
+        # Noise process
+        self.noise = OUNoise(action_size, params["seed"])
+
+        # Replay memory
+        self.memory = ReplayBuffer(
+            action_size, self.params["buffer_size"], self.params["batch_size"], params["seed"])
+
+        self.t_step = 0
 
         self.iter = 0
 
@@ -199,91 +226,132 @@ class AgentMADDPG:
             ddpg_agent.actor_target for ddpg_agent in self.maddpg_agent]
         return target_actors
 
-    def act(self, obs_all_agents, noise=0.0):
+    def act(self, obs_all_agents, no_grad=True):
         """get actions from all agents in the MADDPG object"""
-        actions = [agent.act(obs, noise) for agent, obs in zip(
-            self.maddpg_agent, obs_all_agents)]
+        # Reshape to be consistent with target_act
+        if obs_all_agents.shape[1] != self.state_size * self.n_agents:
+            obs_all_agents = obs_all_agents.reshape(
+                -1, self.state_size * self.n_agents)
+        actions = []
+        for i, agent in enumerate(self.maddpg_agent):
+            obs = self.select_agent_state(obs_all_agents, i)
+            actions.append(agent.act(obs, no_grad=no_grad))
+        actions = torch.cat(actions, dim=1)
         return actions
 
-    def target_act(self, obs_all_agents, noise=0.0):
+    def target_act(self, obs_all_agents, no_grad=True):
         """get target network actions from all the agents in the MADDPG object """
-        target_actions = [ddpg_agent.target_act(
-            obs, noise) for ddpg_agent, obs in zip(self.maddpg_agent, obs_all_agents)]
+        target_actions = []
+        for i, agent in enumerate(self.maddpg_agent):
+            obs = self.select_agent_state(obs_all_agents, i)
+            target_actions.append(agent.target_act(obs, no_grad=no_grad))
+        target_actions = torch.cat(target_actions, dim=1)
         return target_actions
 
-    def update(self, samples, agent_number, logger):
+    def get_agent_state_idx(self, agent_number):
+        return int(agent_number * self.state_size), int((agent_number + 1) * self.state_size)
+
+    def get_agent_action_idx(self, agent_number):
+        return int(agent_number * self.action_size), int((agent_number + 1) * self.action_size)
+
+    def select_agent_state(self, concatenated_states, agent_number):
+        idx1, idx2 = self.get_agent_state_idx(agent_number)
+        return concatenated_states[:, idx1:idx2]
+
+    def select_agent_action(self, concatenated_actions, agent_number):
+        idx1, idx2 = self.get_agent_action_idx(agent_number)
+        return concatenated_actions[:, idx1:idx2]
+
+    def step(self, state, action, reward, next_state, done):
+        """Save experience in replay memory, and use random sample from buffer to learn."""
+        # Let's see if flattening everything helps
+        state = state.reshape(-1, self.n_agents * self.state_size)
+        action = action.reshape(-1, self.n_agents * self.action_size)
+        next_state = next_state.reshape(-1, self.n_agents * self.state_size)
+        # And just to be safe, make sure that everything has the same shape
+        reward = np.expand_dims(np.array(reward), axis=1).T
+        done = np.expand_dims(np.array(done), axis=1).T
+
+        # Save experience / reward
+        self.memory.add(state, action, reward, next_state, done)
+
+        # Learn, if enough samples are available in memory
+        self.t_step = (self.t_step + 1) % self.params["update_every"]
+        if self.t_step == 0:
+            if len(self.memory) > self.params["batch_size"]:
+                for i in range(self.params["update_steps"]):
+                    self.learn()
+
+    def reset(self):
+        for agent in self.maddpg_agent:
+            agent.reset()
+
+    def learn(self):
+        for a_i in range(self.n_agents):
+            experiences = self.memory.sample()
+            self.update(experiences, a_i)
+        self.update_targets()  # soft update the target network towards the actual networks
+
+    def update(self, experiences, agent_number):
         """update the critics and actors of all the agents """
 
-        # need to transpose each element of the samples
-        # to flip obs[parallel_agent][agent_number] to
-        # obs[agent_number][parallel_agent]
-        obs, obs_full, action, reward, next_obs, next_obs_full, done = map(
-            transpose_to_tensor, samples)
-
-        obs_full = torch.stack(obs_full)
-        next_obs_full = torch.stack(next_obs_full)
+        states, actions, rewards, next_states, dones = experiences
 
         agent = self.maddpg_agent[agent_number]
         agent.critic_optimizer.zero_grad()
 
-        # critic loss = batch mean of (y- Q(s,a) from target network)^2
-        # y = reward of this timestep + discount * Q(st+1,at+1) from target network
-        target_actions = self.target_act(next_obs)
-        target_actions = torch.cat(target_actions, dim=1)
-
-        target_critic_input = torch.cat(
-            (next_obs_full.t(), target_actions), dim=1).to(device)
+        # I don't know why, but it wasn't working with calling self.target_act() or .act()
+        obs_all = [states[:, 0:24], states[:, 24:]]
+        next_obs_all = [next_states[:, 0:24], next_states[:, 24:]]
+        if not self.params["double"]:
+            next_actions = [self.maddpg_agent[i].actor_target(
+                obs) for i, obs in enumerate(next_obs_all)]
+            # next_actions = self.target_act(next_states, no_grad=False)
+        else:
+            next_actions = [self.maddpg_agent[i].actor_local(
+                obs) for i, obs in enumerate(next_obs_all)]
 
         with torch.no_grad():
-            q_next = agent.target_critic(target_critic_input)
+            q_next = agent.critic_target(torch.cat(next_obs_all, dim=1),
+                                         torch.cat(next_actions, dim=1)).squeeze()
 
-        y = reward[agent_number].view(-1, 1) + self.params["gamma"] * \
-            q_next * (1 - done[agent_number].view(-1, 1))
-        action = torch.cat(action, dim=1)
-        critic_input = torch.cat((obs_full.t(), action), dim=1).to(device)
-        q = agent.critic(critic_input)
+        y = rewards[:, agent_number] + self.params["gamma"] * \
+            q_next * (1 - dones[:, agent_number])
+        q = agent.critic_local(torch.cat(obs_all, dim=1), actions).squeeze()
 
-        huber_loss = torch.nn.SmoothL1Loss()
-        critic_loss = huber_loss(q, y.detach())
+        # huber_loss = torch.nn.SmoothL1Loss()
+        # critic_loss = huber_loss(q, y.detach())
+        critic_loss = F.mse_loss(q, y)
         critic_loss.backward()
-        #torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 0.5)
+        # torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 0.5)
         agent.critic_optimizer.step()
 
         # update actor network using policy gradient
         agent.actor_optimizer.zero_grad()
-        # make input to agent
-        # detach the other agents to save computation
-        # saves some time for computing derivative
-        q_input = [self.maddpg_agent[i].actor(ob) if i == agent_number
-                   else self.maddpg_agent[i].actor(ob).detach()
-                   for i, ob in enumerate(obs)]
-
-        q_input = torch.cat(q_input, dim=1)
-        # combine all the actions and observations for input to critic
-        # many of the obs are redundant, and obs[1] contains all useful information already
-        q_input2 = torch.cat((obs_full.t(), q_input), dim=1)
 
         # get the policy gradient
-        actor_loss = -agent.critic(q_input2).mean()
+        # again, for some reason, self.act() wasn't working - gave a backward error
+        # local_actions = self.act(states, no_grad=False)
+
+        local_actions = [self.maddpg_agent[i].actor_local(
+            obs) for i, obs in enumerate(obs_all)]
+
+        actor_loss = - \
+            agent.critic_local(torch.cat(obs_all, dim=1),
+                               torch.cat(local_actions, dim=1)).mean()
+        # actor_loss = -agent.critic_local(states, local_actions).mean()
         actor_loss.backward()
         # torch.nn.utils.clip_grad_norm_(agent.actor.parameters(),0.5)
         agent.actor_optimizer.step()
-
-        al = actor_loss.cpu().detach().item()
-        cl = critic_loss.cpu().detach().item()
-        logger.add_scalars('agent%i/losses' % agent_number,
-                           {'critic loss': cl,
-                            'actor_loss': al},
-                           self.iter)
 
     def update_targets(self):
         """soft update targets"""
         self.iter += 1
         for ddpg_agent in self.maddpg_agent:
-            soft_update(ddpg_agent.target_actor,
-                        ddpg_agent.actor, self.params["tau"])
-            soft_update(ddpg_agent.target_critic,
-                        ddpg_agent.critic, self.params["tau"])
+            soft_update(ddpg_agent.actor_target,
+                        ddpg_agent.actor_local, self.params["tau"])
+            soft_update(ddpg_agent.critic_target,
+                        ddpg_agent.critic_local, self.params["tau"])
 
 
 class OUNoise:

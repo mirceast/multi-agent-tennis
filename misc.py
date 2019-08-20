@@ -10,32 +10,78 @@ from copy import deepcopy
 import matplotlib.pyplot as plt
 import torch
 
-from agents import AgentDDPG
-
-
-def get_env_info(env):
-    brain_name = env.brain_names[0]
-    brain = env.brains[brain_name]
-    env_info = env.reset(train_mode=True)[brain_name]
-    action_size = brain.vector_action_space_size
-    n_agents = len(env_info.agents)
-    states = env_info.vector_observations
-    state_size = states.shape[1]
-    return brain_name, n_agents, state_size, action_size
+from agents import AgentDDPG, AgentMADDPG
+from utilities import get_env_info
 
 
 def run(env, params):
     brain_name, n_agents, state_size, action_size = get_env_info(env)
     if params["type"].lower() == "ddpg":
         agent = AgentDDPG(state_size=state_size,
-                      action_size=action_size, params=params)
+                          action_size=action_size, params=params)
         scores = ddpg(agent, env, params)
     elif params["type"].lower() == "2 ddpg":
         agent = [AgentDDPG(state_size=state_size, action_size=action_size,
-                       params=params) for i in range(n_agents)]
+                           params=params) for i in range(n_agents)]
+        scores = ddpg(agent, env, params)
+    elif params["type"].lower() == "maddpg":
+        agent = AgentMADDPG(env, params)
         scores = ddpg(agent, env, params)
     else:
-        raise Exception("'type' can be 'ddpg', '2 ddpg'")
+        raise Exception("'type' can be 'ddpg', '2 ddpg', 'maddpg'")
+
+
+def ddpg(agent, env, params):
+    # Get environment information
+    brain_name, n_agents, state_size, action_size = get_env_info(env)
+
+    # Initialize stuff
+    log = Logger(params, agent)
+
+    for _ in range(1, params["n_episodes"]+1):
+        env_info = env.reset(train_mode=True)[brain_name]
+        if isinstance(agent, list):
+            for i in range(n_agents):
+                agent[i].reset()
+        else:
+            agent.reset()
+        states = env_info.vector_observations
+
+        episode_scores = np.zeros(n_agents)
+        for t in range(params["max_steps"]):
+            if isinstance(agent, list):
+                actions = np.zeros((n_agents, action_size))
+                for i in range(n_agents):
+                    actions[i] = agent[i].act(states[i])
+            else:
+                actions = agent.act(states)
+            if params["type"].lower() == "maddpg":
+                actions = actions.reshape(n_agents, action_size)
+            actions = actions.detach().cpu().numpy()
+            env_info = env.step(actions)[brain_name]
+            next_states = env_info.vector_observations
+            rewards = env_info.rewards
+            dones = env_info.local_done
+            if isinstance(agent, list):
+                for i in range(n_agents):
+                    agent[i].step(states[i], actions[i], rewards[i],
+                                  next_states[i], dones[i])
+            else:
+                agent.step(states, actions, rewards, next_states, dones)
+            episode_scores += rewards
+            states = next_states
+            # check if we should save and show progress
+            log.tic()
+            if np.any(dones):
+                break
+
+        log.update(agent, episode_scores, t+1)
+        log.tic()
+        if log.solved and params["stop_on_solve"]:
+            break
+        if time.time() - log.t_start > params["max_time"] + 5:
+            break
+    return agent, log
 
 
 class Logger():
@@ -90,11 +136,34 @@ class Logger():
                     self.data["critic_target_dict"][i] = agent[i].critic_target.state_dict(
                     )
 
-        else:
+        elif isinstance(agent, AgentDDPG):
             self.data["actor_local_dict"] = agent.actor_local.state_dict()
             self.data["actor_target_dict"] = agent.actor_target.state_dict()
             self.data["critic_local_dict"] = agent.critic_local.state_dict()
             self.data["critic_target_dict"] = agent.critic_target.state_dict()
+
+        elif isinstance(agent, AgentMADDPG):
+            if not "actor_local_dict" in self.data:
+                temp = []
+                for i in range(len(agent.maddpg_agent)):
+                    temp.append([])
+                self.data["actor_local_dict"] = deepcopy(temp)
+                self.data["actor_target_dict"] = deepcopy(temp)
+                self.data["critic_local_dict"] = deepcopy(temp)
+                self.data["critic_target_dict"] = deepcopy(temp)
+            else:
+                for i in range(len(agent.maddpg_agent)):
+                    self.data["actor_local_dict"][i] = agent.maddpg_agent[i].actor_local.state_dict(
+                    )
+                    self.data["actor_target_dict"][i] = agent.maddpg_agent[i].actor_target.state_dict(
+                    )
+                    self.data["critic_local_dict"][i] = agent.maddpg_agent[i].critic_local.state_dict(
+                    )
+                    self.data["critic_target_dict"][i] = agent.maddpg_agent[i].critic_target.state_dict(
+                    )
+
+        else:
+            raise Exception("Unkown agent type.")
 
     def update(self, agent, episode_scores, steps):
         self.comb_score_window.append(np.max(episode_scores))
@@ -109,12 +178,13 @@ class Logger():
 
     def show_progress(self):
         if len(self.data["mean_scores"]):
-            print('\rMin agent score: {:.2f}\tMax agent score: {:.2f}\tMax steps: {}\tTotal time: {}'.format(
+            print('\rMin agent score: {:.2f}\tMax agent score: {:.2f}\tMax steps: {}\tTotal time: {}\tEpisodes: {}'.format(
                 min(self.data["mean_scores"][-1]),
                 max(self.data["mean_scores"][-1]),
                 self.data["steps_done"][-1],
-                seconds_to_time_str(time.time() - self.t_start)), end="")
-        if self.data["steps_done"][-1] > 5000:
+                seconds_to_time_str(time.time() - self.t_start),
+                len(self.data["scores"])), end="")
+        if len(self.data["mean_scores"]) and self.data["steps_done"][-1] > 5000:
             raise Exception("debug")
 
     def tic(self):
@@ -150,56 +220,6 @@ class Logger():
         save_path = os.path.join(self.data["folder"], name + ".pkl")
         with open(save_path, 'wb') as f:
             pickle.dump(self.data, f)
-
-
-def ddpg(agent, env, params):
-    # Get environment information
-    brain_name, n_agents, state_size, action_size = get_env_info(env)
-
-    # Initialize stuff
-    log = Logger(params, agent)
-
-    for _ in range(1, params["n_episodes"]+1):
-        env_info = env.reset(train_mode=True)[brain_name]
-        if isinstance(agent, list):
-            for i in range(n_agents):
-                agent[i].reset()
-        else:
-            agent.reset()
-        states = env_info.vector_observations
-
-        episode_scores = np.zeros(n_agents)
-        for t in range(params["max_steps"]):
-            if isinstance(agent, list):
-                actions = np.zeros((n_agents, action_size))
-                for i in range(n_agents):
-                    actions[i] = agent[i].act(states[i])
-            else:
-                actions = agent.act(states)
-            env_info = env.step(actions)[brain_name]
-            next_states = env_info.vector_observations
-            rewards = env_info.rewards
-            dones = env_info.local_done
-            if isinstance(agent, list):
-                for i in range(n_agents):
-                    agent[i].step(states[i], actions[i], rewards[i],
-                                  next_states[i], dones[i])
-            else:
-                agent.step(states, actions, rewards, next_states, dones)
-            episode_scores += rewards
-            states = next_states
-            # check if we should save and show progress
-            log.tic()
-            if np.any(dones):
-                break
-
-        log.update(agent, episode_scores, t+1)
-        log.tic()
-        if log.solved and params["stop_on_solve"]:
-            break
-        if time.time() - log.t_start > params["max_time"] + 5:
-            break
-    return agent, log
 
 
 def find_state_mag(env, max_steps=1000, n_episodes=1000):

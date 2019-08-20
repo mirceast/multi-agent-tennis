@@ -31,7 +31,7 @@ print('There are {} agents. Each observes a state with length: {}'.format(
 
 # Set all parameters
 # weight_init can be "uniform" or "kaiming"
-# type can be "DDPG", "2 DDPG"
+# type can be "DDPG", "2 DDPG, 'MADDPG'"
 params = {
     "buffer_size": int(1e6),
     "batch_size": 128,
@@ -42,7 +42,7 @@ params = {
     "weight_decay": 0,
     "update_every": 20,
     "update_steps": 10,
-    "double": True,
+    "double": False,
     "fc1": 400,
     "fc2": 300,
     "batchnorm": True,
@@ -56,12 +56,13 @@ params = {
     "verbose": True,
     "max_time": 200*60,
     "score_solved": 0.5,
-    "stop_on_solve": True,
+    "stop_on_solve": False,
     "folder": "trained/test",
-    "overwrite": False,
-    "type": "DDPG"
+    "overwrite": True,
+    "type": "MADDPG"
 }
 
+torch.autograd.set_detect_anomaly(True)
 run(env, params)
 
 env.close()
